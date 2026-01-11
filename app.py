@@ -7,468 +7,265 @@ import sqlite3
 from datetime import datetime
 import json
 from streamlit_mic_recorder import speech_to_text
-from datetime import datetime
+import requests
 
 # ==========================================
-# 1. 基础配置（在这里填入你的 API Key）
+# 1. 基础配置
 # ==========================================
 DEEPSEEK_API_KEY = "sk-9e305b3990ac4ddc8819da6072444544"
+client = openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-client = openai.OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
-)
+if 'active_tab' not in st.session_state: st.session_state.active_tab = "🥗 餐厅"
+if 'travel_chat_history' not in st.session_state: st.session_state.travel_chat_history = []
+if 'current_plan' not in st.session_state: st.session_state.current_plan = ""
+
+st.set_page_config(page_title="智生活", page_icon="🌟", layout="wide")
+
+# 高德地图配置
+AMAP_KEY = "b609ca55fb8d7dc44546632460d0e93a"  
+
+def get_amap_info(address):
+    """获取目的地的城市代码、经纬度和实时天气"""
+    try:
+        # 1. 地理编码：查地址
+        geo_url = f"https://restapi.amap.com/v3/geocode/geo?address={address}&key={AMAP_KEY}"
+        geo_data = requests.get(geo_url).json()
+        
+        if geo_data['status'] == '1' and geo_data['geocodes']:
+            # 优先匹配更出名的旅游城市（针对同名地点优化）
+            location = geo_data['geocodes'][0]
+            adcode = location['adcode']      
+            lon_lat = location['location']    
+            formatted_address = location['formatted_address'] # 获取详细地址
+            
+            # 2. 查询实时天气
+            weather_url = f"https://restapi.amap.com/v3/weather/weatherInfo?city={adcode}&key={AMAP_KEY}"
+            weather_data = requests.get(weather_url).json()
+            real_weather = "暂无天气数据"
+            if weather_data['status'] == '1' and weather_data['lives']:
+                w = weather_data['lives'][0]
+                real_weather = f"{w['weather']}，气温{w['temperature']}℃，风力{w['windpower']}级"
+            
+            return {
+                "full_address": formatted_address,
+                "weather": real_weather,
+                "location": lon_lat
+            }
+    except: return None
+    return None
 
 # ==========================================
-# 2. 数据库逻辑（实现离线存储功能）
+# 2. 数据库逻辑
 # ==========================================
 def init_db():
-    conn = sqlite3.connect('history.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS records 
-                 (type TEXT, content TEXT, time TEXT)''')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect('history.db') as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS records (type TEXT, content TEXT, time TEXT)')
 
-def save_record(type, content):
-    conn = sqlite3.connect('history.db')
-    c = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.execute("INSERT INTO records VALUES (?, ?, ?)", (type, content, now))
-    conn.commit()
-    conn.close()
+def save_record(rtype, content):
+    with sqlite3.connect('history.db') as conn:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("INSERT INTO records VALUES (?, ?, ?)", (rtype, str(content), now))
 
-# ==========================================
-# 3. 核心功能函数
-# ==========================================
-
-# 加载OCR引擎（缓存以提高速度）
 @st.cache_resource
 def get_ocr_reader():
     return easyocr.Reader(['ch_sim', 'en'])
 
-# 餐饮场景逻辑
-def analyze_menu(image, user_goal):
-    reader = get_ocr_reader()
-    # 将上传的文件转为OCR可读格式
+def get_ocr_text(image):
     img_np = np.array(Image.open(image))
-    result = reader.readtext(img_np, detail=0)
-    menu_text = " ".join(result)
-
-    prompt = f"""
-    【重要指令：安全第一】
-    用户当前的身体状况与目标：{user_goal}
-    菜单内容：{menu_text}
-    
-    作为“智生活”营养顾问，你必须严格遵守以下审核流程：
-    
-    1. ❌ 【过敏原红线】：
-       - 仔细检查菜单，如果发现任何含有用户过敏成分（如：{user_goal}中提到的海鲜、花生等）的菜品，**严禁**将其列入推荐名单。
-       - 必须在报告开头明确列出这些“禁忌菜品”并给予强烈警告。
-
-    2. ✅ 【安全推荐】：
-       - 在排除了过敏原后，从剩余菜品中挑选最符合“控糖、少油”目标的菜。
-       - 理由要结合健康和安全。
-
-    3. 🔄 【优化替代】：
-       - 提供健康的替换方案，同样要确保替代品不含过敏原。
-
-    4. 💡 【热量与寄语】：预估热量并给出叮嘱。
-
-    请用非常严肃且负责任的语气回答。如果发现菜单全是海鲜而用户海鲜过敏，请直接告知用户“这份菜单对您不安全”。
-    """
-    
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role": "system", "content": "你是一位极度严谨、优先考虑食品安全的营养医师。"},
-                  {"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
-
-# 出行场景逻辑
-def generate_itinerary(user_input):
-    # 模拟外部API数据（如果是比赛演示，可以手动在这里改一下城市和天气，让它看起来更真实）
-    # 也可以让 AI 根据当前月份（1月）自动推断当地的大致气候
-    current_month = datetime.now().strftime("%m")
-    
-    prompt = f"""
-    用户需求：{user_input}
-    当前月份：{current_month}月
-    
-    任务：请为用户生成一份详细的周末游行程规划。
-    要求输出内容必须包含以下三个板块：
-
-    1. 🌦️ 【天气与穿着建议】
-       - 根据目的地和当前月份，预估当地的温度区间。
-       - 给出具体的天气状况（如：晴、多云）。
-       - **重点**：给出详细的穿衣建议（如：建议叠穿、带厚羽绒服、由于有徒步建议穿运动鞋等）。
-
-    2. 📅 【结构化行程表】
-       - 使用 Markdown 表格。
-       -**绝对不要**在表格中使用<br>、<div>等HTML标签。
-       -确保输出的是纯净的文本格式。
-       - 包含列：时间段、活动内容、交通建议、预约提醒/链接。
-
-    3. 💡 【出行小贴士】
-       - 包含防晒、补水、离线地图下载等建议。
-
-    请用亲切、专业的语气回答，并多使用 Emoji 增加可读性。
-    """
-    
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role": "system", "content": "你是一位贴心的旅游管家。"},
-                  {"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
+    result = get_ocr_reader().readtext(img_np, detail=0)
+    return " ".join(result)
 
 # ==========================================
-# 4. Streamlit 界面布局
+# 3. 终极 CSS（整合去红边、固定头部、打字机、录音按钮美化）
+# ==========================================
+st.markdown("""
+<style>
+    /* 6. 录音组件深度美化：消除白色长条 */
+    /* 强制定位录音插件的容器，使其宽度自适应内容而非铺满整行 */
+    [data-testid="stVerticalBlock"] div:has(iframe[title="streamlit_mic_recorder.speech_to_text"]) {
+        width: fit-content !important;
+        background-color: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    /* 强制调整 iframe 窗口本身的大小 */
+    iframe[title="streamlit_mic_recorder.speech_to_text"] {
+        width: 160px !important; /* 调整为你按钮文字的大致宽度 */
+        height: 60px !important;
+        border: none !important;
+        background: transparent !important;
+    }
+    /* 1. 隐藏官方元素 */
+    header, footer, .stDeployButton, [data-testid="stHeader"] { display: none !important; }
+    .stApp { background-color: #f8f9fb !important; }
+
+    /* 2. 主内容区顶部预留位 */
+    .main .block-container {
+        padding-top: 240px !important; 
+        padding-bottom: 2rem !important; 
+        max-width: 800px !important; margin: auto;
+    }
+
+    /* 3. 固定头部容器 */
+    .fixed-header {
+        position: fixed !important; top: 0px !important; left: 0px !important; width: 100% !important;
+        background-color: white !important; box-shadow: 0 4px 20px rgba(0,0,0,0.05) !important;
+        z-index: 999999 !important; padding: 30px 0 35px 0 !important; text-align: center;
+    }
+
+    /* 4. 导航按钮间距与布局 */
+    .fixed-header [data-testid="stHorizontalBlock"] {
+        display: flex !important; flex-direction: row !important; justify-content: center !important;
+        gap: 20px !important; max-width: 650px !important; margin: 0 auto !important;
+    }
+
+    /* 5. 按钮样式：去红边、蓝色高亮 */
+    div.stButton > button {
+        border-radius: 14px !important; height: 45px !important; font-weight: 600 !important;
+        border: 0px solid transparent !important; outline: none !important; box-shadow: none !important;
+    }
+    div.stButton > button[kind="primary"] { background-color: #1E5EFF !important; color: white !important; }
+    div.stButton > button[kind="secondary"] { background-color: #fcfcfc !important; color: #666 !important; border: 1px solid #f0f2f6 !important; }
+    div.stButton > button:focus, div.stButton > button:active { outline: none !important; box-shadow: none !important; border: none !important; }
+
+    /* 6. 录音组件美化 */
+    iframe[title="streamlit_mic_recorder.speech_to_text"] { 
+        height: 70px !important; 
+        width: 100% !important; /* 改为 100%，由外面 st.columns 控制 */
+        border: none !important; 
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 4. 渲染标题与导航栏
+# ==========================================
+def render_fixed_header():
+    st.markdown('<div class="fixed-header">', unsafe_allow_html=True)
+    st.markdown('<h1 style="margin:0; padding-bottom: 25px; color:#333; letter-spacing: 2px; font-size: 38px; font-weight: 800;">🤖 智生活服务助手</h1>', unsafe_allow_html=True)
+    nav_col1, nav_col2, nav_col3 = st.columns(3)
+    with nav_col1:
+        if st.button("🥗 餐厅", key="h1", use_container_width=True, type="primary" if st.session_state.active_tab == "🥗 餐厅" else "secondary"):
+            st.session_state.active_tab = "🥗 餐厅"; st.rerun()
+    with nav_col2:
+        if st.button("🚗 出行", key="h2", use_container_width=True, type="primary" if st.session_state.active_tab == "🚗 出行" else "secondary"):
+            st.session_state.active_tab = "🚗 出行"; st.rerun()
+    with nav_col3:
+        if st.button("📂 历史", key="h3", use_container_width=True, type="primary" if st.session_state.active_tab == "📂 历史" else "secondary"):
+            st.session_state.active_tab = "📂 历史"; st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ==========================================
+# 5. 主程序逻辑
 # ==========================================
 def main():
     init_db()
-    st.set_page_config(page_title="AI智能生活助手", page_icon="🌟")
-    st.markdown("""
-    <style>
-    /* 去掉 Tab 内容默认上边距 */
-    [data-testid="stTabContent"] {
-        padding-top: 0 !important;
-        margin-top: 0 !important;
-    }
-    /* ===== 全局背景 ===== */
-    .stApp {
-        background: linear-gradient(180deg, #f6f8fb 0%, #eef2f7 100%);
-        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    }
+    render_fixed_header()
+    
+    if st.session_state.active_tab == "🥗 餐厅":
+        st.markdown('<h3 style="font-size: 24px; color: #444; margin-bottom: 10px;">🥗 智能餐厅</h3>', unsafe_allow_html=True)
+        with st.container(border=True):
+            goal = st.text_input("健康需求", placeholder="例如：海鲜过敏、控糖", key="rest_goal")
+            file = st.file_uploader("上传菜单照片", type=['jpg', 'png', 'jpeg'])
+            if st.button("🚀 开始分析成分", use_container_width=True, key="do_ocr"):
+                if file:
+                    with st.spinner("智生活分析中..."):
+                        menu_text = get_ocr_text(file)
+                        ph = st.empty(); full_res = ""
+                        response = client.chat.completions.create(
+                            model="deepseek-chat",
+                            messages=[{"role": "user", "content": f"目标：{goal}。菜单：{menu_text}。请检查风险并推荐。"}],
+                            stream=True 
+                        )
+                        for chunk in response:
+                            if chunk.choices[0].delta.content:
+                                full_res += chunk.choices[0].delta.content
+                                ph.markdown(full_res + "▌")
+                        ph.markdown(full_res)
+                        save_record("餐饮识别", full_res)
 
-    /* ===== 主内容区宽度 ===== */
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 3rem;
-        max-width: 1100px;
-    }
-
-    /* ===== 标题 ===== */
-    h1, h2, h3 {
-        font-weight: 700;
-    }
-
-    /* ===== Tabs 美化 ===== */
-    [data-baseweb="tab-list"] {
-        gap: 12px;
-    }
-
-    [data-baseweb="tab"] {
-        background: #ffffff;
-        border-radius: 14px;
-        padding: 10px 22px;
-        font-weight: 600;
-        color: #666;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.04);
-    }
-
-    [data-baseweb="tab"][aria-selected="true"] {
-        background: linear-gradient(135deg, #4f8cff, #6fb1ff);
-        color: white;
-    }
-
-    /* ===== 卡片容器 ===== */
-    .app-card {
-        background: white;
-        border-radius: 18px;
-        padding: 24px;
-        margin-bottom: 24px;
-        box-shadow: 0 12px 30px rgba(0,0,0,0.06);
-    }
-
-    /* ===== 输入框 ===== */
-    input, textarea {
-        border-radius: 12px !important;
-    }
-
-    /* ===== 按钮统一风格 ===== */
-    button[kind="primary"] {
-        background: linear-gradient(135deg, #4f8cff, #6fb1ff) !important;
-        border-radius: 14px !important;
-        height: 46px;
-        font-weight: 600;
-    }
-
-    button[kind="secondary"] {
-        border-radius: 14px !important;
-        height: 46px;
-        font-weight: 600;
-    }
-
-    /* ===== Download 按钮 ===== */
-    [data-testid="stDownloadButton"] button {
-        background: linear-gradient(135deg, #34c759, #4cd964) !important;
-        color: white !important;
-        border-radius: 14px;
-        height: 46px;
-    }
-
-    /* ===== 展示 Markdown 内容更舒服 ===== */
-    .stMarkdown {
-        line-height: 1.75;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    st.title("智能生活服务助手")
-    st.markdown("---")
-
-    tab1, tab2, tab3 = st.tabs(["🥗 智能餐厅", "🚗 出行规划", "📂 历史/离线"])
-
-    # --- Tab 1: 餐饮场景 ---
-    with tab1:
-        # ===== 样式（仅作用于本 Tab）=====
-        st.markdown("""
-            <style>
-            /* 卡片容器 */
-            .menu-card {
-                background: white;
-                border-radius: 18px;
-                padding: 24px;
-                box-shadow: 0 12px 30px rgba(0,0,0,0.06);
-                margin-bottom: 24px;
-            }
-
-            /* 上传区域文字隐藏 */
-            [data-testid="stFileUploaderDropzoneInstructions"] div span,
-            [data-testid="stFileUploaderDropzoneInstructions"] div small {
-                display: none !important;
-            }
-
-            /* 上传区域中文提示 */
-            [data-testid="stFileUploaderDropzoneInstructions"] div::before {
-                content: "将图片拖拽至此或上传菜单照片";
-                display: block;
-                font-size: 16px;
-                font-weight: 600;
-                margin-bottom: 6px;
-            }
-
-            [data-testid="stFileUploaderDropzoneInstructions"] div::after {
-                content: "支持 JPG / PNG / JPEG，单张 ≤ 200MB";
-                display: block;
-                font-size: 12px;
-                color: #808495;
-            }
-
-            /* 只改上传按钮 */
-            [data-testid="stFileUploader"] button[data-testid="stBaseButton-secondary"] {
-                font-size: 0 !important;
-                border-radius: 12px !important;
-                padding: 6px 16px !important;
-            }
-
-            [data-testid="stFileUploader"] button[data-testid="stBaseButton-secondary"]::after {
-                content: "📷 浏览文件";
-                font-size: 14px !important;
-                font-weight: 600;
-            }
-
-            /* 主按钮 */
-            .menu-analyze-btn button {
-                width: 100%;
-                height: 46px;
-                border-radius: 14px;
-                font-weight: 600;
-            }
-            </style>
-        """, unsafe_allow_html=True)
-
-        # ===== 卡片开始 =====
-        st.header("🥗 菜单智能识别")
-        st.caption("拍照上传菜单，获取安全、健康的饮食建议")
-
-        goal = st.text_input(
-            "你的健康需求",
-            placeholder="例如：控糖、少油、花生过敏"
-        )
-
-        file = st.file_uploader(
-            "上传菜单图片",
-            type=['jpg', 'png', 'jpeg']
-        )
-
-        st.markdown('<div class="menu-analyze-btn">', unsafe_allow_html=True)
-        analyze_clicked = st.button("🚀 开始分析")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # ===== 分析逻辑（完全不变）=====
-        if file and analyze_clicked:
-            with st.spinner("智生活正在分析菜单..."):
-                res_text = analyze_menu(file, goal)
-
-                st.markdown("---")
-                st.subheader("📋 餐饮健康分析报告")
-                st.markdown(res_text)
-
-                save_record("餐饮", res_text)
-
-    # --- Tab 2: 出行场景 ---
-    with tab2:
-        # ===== 样式（只影响 Tab2）=====
-        st.markdown("""
-        <style>
-        .travel-card {
-            background: white;
-            border-radius: 18px;
-            padding: 24px;
-            box-shadow: 0 12px 30px rgba(0,0,0,0.06);
-            margin-bottom: 24px;
-        }
-
-        .travel-btn button {
-            width: 100%;
-            height: 46px;
-            border-radius: 14px;
-            font-weight: 600;
-        }
-
-        .travel-result {
-            background: #fafbff;
-            border-radius: 16px;
-            padding: 20px;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
-        # ===== Session 初始化（不动）=====
-        if 'travel_chat_history' not in st.session_state:
-            st.session_state.travel_chat_history = []
-        if 'current_plan' not in st.session_state:
-            st.session_state.current_plan = ""
-
-        st.header("🚗 旅游行程智能规划")
-        st.caption("支持语音输入，可多轮修改行程")
-
-        st.write("🎤 点击下方按钮说话或直接输入旅行需求：")
-        v_text = speech_to_text(
-            language='zh',
-            start_prompt="🎤 点击说话",
-            just_once=True,
-            key="travel_stt"
-        )
-        input_val = st.text_input(
-            "你的旅行想法 / 修改需求",
-            value=v_text if v_text else "",
-            placeholder="例如：带 5 岁小孩去北京自然博物馆 / 把午饭换成素食"
-        )
-
-        col1, col2 = st.columns(2)
-        with col1:
-            generate_btn = st.button("🌟 生成全新行程")
-        with col2:
-            update_btn = st.button("🔄 修改 / 追加需求")
-
-        # ===== 业务逻辑（完全不变）=====
-        if generate_btn and input_val:
-            st.session_state.travel_chat_history = []
-            with st.spinner("智生活正在为您规划全新行程..."):
-                messages = [
-                    {"role": "system", "content": "你是一位专业的旅游管家。请生成带天气、穿着建议和Markdown表格行程的计划。"},
-                    {"role": "user", "content": input_val}
-                ]
-
-                response = client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=messages
+    elif st.session_state.active_tab == "🚗 出行":
+        st.markdown('<h3 style="font-size: 24px; color: #444; margin-bottom: 10px;">🚗 智能出行规划</h3>', unsafe_allow_html=True)
+        
+        with st.container(border=True):
+            st.write("🎤 **语音录入需求**：")
+            
+            # 使用更小的比例，比如 0.2，让第一列尽可能窄
+            col_mic, col_empty = st.columns([0.2, 1.9]) 
+            
+            with col_mic:
+                v_text = speech_to_text(
+                    language='zh', 
+                    start_prompt="🎤 点击录制需求", 
+                    stop_prompt="停止录音", 
+                    just_once=True, 
+                    key="travel_mic_final_fixed"
                 )
+            
+            # 紧跟在录音按钮下方的输入框
+            query = st.text_input(
+                "您的想法", 
+                value=v_text if v_text else "", 
+                placeholder="例如：这周末带孩子去瓦屋山玩",
+                key="travel_query_input"
+            )
+            
+            if st.button("🌟 生成/修改精准行程", use_container_width=True, key="btn_plan_pro"):
+                if query:
+                    with st.spinner("智生活正在校准地理位置与实时天气..."):
+                        # --- 步骤 1：提取干净地名 ---
+                        extract_prompt = f"请从这段话中提取出目的地景点名称：'{query}'。注意：1. 如果该景点有多个同名地点，请返回全国最知名的那个旅游景区全称（例如：瓦屋山 -> 四川眉山瓦屋山国家森林公园）。2. 只需返回地名，不要任何解释。"
+                        extract_res = client.chat.completions.create(
+                            model="deepseek-chat",
+                            messages=[{"role": "user", "content": extract_prompt}]
+                        )
+                        clean_dest = extract_res.choices[0].message.content.strip()
 
-                new_plan = response.choices[0].message.content.replace("<br>", " ")
+                        # --- 步骤 2：调用高德 API ---
+                        amap_data = get_amap_info(clean_dest)
+                        
+                        if amap_data:
+                            st.info(f"📍 已为您定位到：**{amap_data['full_address']}**")
+                            st.success(f"🌦️ 实时天气：{amap_data['weather']}")
+                            
+                            # --- 步骤 3：生成行程 ---
+                            ph = st.empty()
+                            full_content = ""
+                            prompt_with_real_data = f"【真实背景数据】目的地：{amap_data['full_address']}。当前天气：{amap_data['weather']}。【用户原始需求】{query}。请生成4日Markdown行程、穿衣建议及[点击购票](https://m.ctrip.com/webapp/ticket/ticket?keyword={clean_dest})链接。禁止使用<br>标签。"
+                            
+                            response = client.chat.completions.create(
+                                model="deepseek-chat",
+                                messages=[
+                                    {"role": "system", "content": "你是一位拒绝虚假信息、严谨、贴心的旅游管家。"},
+                                    {"role": "user", "content": prompt_with_real_data}
+                                ],
+                                stream=True
+                            )
+                            for chunk in response:
+                                if chunk.choices[0].delta.content:
+                                    full_content += chunk.choices[0].delta.content
+                                    ph.markdown(full_content + "▌")
+                            ph.markdown(full_content)
+                            st.session_state.current_plan = full_content
+                            save_record("行程规划", full_content)
+                        else:
+                            st.error("无法定位该目的地，请确认地名是否正确。")
 
-                st.session_state.current_plan = new_plan
-                st.session_state.travel_chat_history.append({"role": "user", "content": input_val})
-                st.session_state.travel_chat_history.append({"role": "assistant", "content": new_plan})
-                save_record("出行", new_plan)
-
-        if update_btn and input_val:
-            if not st.session_state.current_plan:
-                st.warning("请先生成一个基础行程，再提出修改要求哦！")
-            else:
-                with st.spinner("智生活正在根据新需求调整行程..."):
-                    messages = [{"role": "system", "content": "你是一位专业的旅游管家。请根据最新要求更新完整行程。"}]
-                    for chat in st.session_state.travel_chat_history:
-                        messages.append(chat)
-                    messages.append({"role": "user", "content": f"请修改需求：{input_val}"})
-
-                    response = client.chat.completions.create(
-                        model="deepseek-chat",
-                        messages=messages
-                    )
-
-                    updated_plan = response.choices[0].message.content.replace("<br>", " ")
-
-                    st.session_state.current_plan = updated_plan
-                    st.session_state.travel_chat_history.append({"role": "user", "content": input_val})
-                    st.session_state.travel_chat_history.append({"role": "assistant", "content": updated_plan})
-                    save_record("出行-修改", updated_plan)
-
-        # ===== 结果卡片 =====
         if st.session_state.current_plan:
-            st.markdown('<div class="travel-card travel-result">', unsafe_allow_html=True)
-
-            st.info(f"📊 实时同步：已根据当前需求更新 {datetime.now().month} 月穿着指南")
+            st.markdown("---")
             st.markdown(st.session_state.current_plan)
 
-            st.download_button(
-                label="💾 下载最终版离线行程单",
-                data=st.session_state.current_plan,
-                file_name="trip_plan_updated.md"
-            )
-
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            
-    # --- Tab 3: 历史记录/离线查看 ---
-    with tab3:
-        # ===== 样式（只影响 Tab3）=====
-        st.markdown("""
-        <style>
-        .history-card {
-            background: white;
-            border-radius: 18px;
-            padding: 24px;
-            box-shadow: 0 12px 30px rgba(0,0,0,0.06);
-        }
-
-        .history-empty {
-            text-align: center;
-            color: #888;
-            padding: 40px 0;
-        }
-
-        /* expander 标题美化 */
-        details > summary {
-            font-size: 15px;
-            font-weight: 600;
-            padding: 12px 8px;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
-        # ===== 卡片开始 =====
-
+    elif st.session_state.active_tab == "📂 历史":
         st.header("📂 最近记录")
-
-        conn = sqlite3.connect('history.db')
-        import pandas as pd
-        df = pd.read_sql_query(
-            "SELECT * FROM records ORDER BY time DESC LIMIT 10",
-            conn
-        )
-        conn.close()
-
-        if df.empty:
-            st.markdown('<div class="history-empty">暂无历史记录</div>', unsafe_allow_html=True)
-        else:
-            for _, row in df.iterrows():
-                with st.expander(f"🕒 {row['time']} · {row['type']}"):
-                    st.markdown(row['content'])
-
+        with sqlite3.connect('history.db') as conn:
+            import pandas as pd
+            try:
+                df = pd.read_sql_query("SELECT * FROM records ORDER BY time DESC LIMIT 15", conn)
+                for _, row in df.iterrows():
+                    with st.expander(f"🕒 {row['time']} · {row['type']}"):
+                        st.markdown(row['content'])
+            except: st.write("暂无记录")
 
 if __name__ == "__main__":
     main()
