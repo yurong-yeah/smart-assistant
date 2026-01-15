@@ -9,6 +9,8 @@ import json
 from streamlit_mic_recorder import speech_to_text
 import requests
 import hashlib
+import base64
+from io import BytesIO
 
 # ==========================================
 # 1. 基础配置
@@ -73,7 +75,32 @@ def save_record(rtype, content):
     with sqlite3.connect('history.db') as conn:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("INSERT INTO records VALUES (?, ?, ?, ?)", (st.session_state.username, rtype, str(content), now))
-
+# --- 新增：Qwen-VL 视觉分析函数 ---
+def analyze_food_image_with_qwen(image_file, user_goal):
+    """使用通义千问视觉模型分析纯菜品图片"""
+    # 1. 编码图片
+    encoded_image = base64.b64encode(image_file.getvalue()).decode('utf-8')
+    
+    # 2. 调用阿里云 OpenAI 兼容接口
+    # 这里的 base_url 需要换成阿里云的地址
+    qwen_client = openai.OpenAI(
+        api_key="sk-3277028448bf47fb84a4dd96a1cb9e4e", 
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    
+    response = qwen_client.chat.completions.create(
+        model="qwen-vl-plus", # 视觉增强版
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"你是一位AI营养师。用户需求：{user_goal}。请识别图中菜品，分析食材成分，并给出热量和健康建议。"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}}
+                ]
+            }
+        ]
+    )
+    return response.choices[0].message.content
 # ==========================================
 # 3. 核心功能与 CSS
 # ==========================================
@@ -179,23 +206,46 @@ def main():
     if st.session_state.active_tab == "🥗 餐厅":
         st.markdown(f"#### 欢迎回来，{user_nickname}")
         with st.container(border=True):
-            # 自动读取用户画像里的过敏原
-            goal = st.text_input("健康需求 (已自动加载您的画像)", value=user_allergies, placeholder="如：海鲜过敏")
-            file = st.file_uploader("上传菜单照片")
-            if st.button("🚀 开始分析", use_container_width=True):
+            goal = st.text_input("📋 健康需求", value=user_allergies)
+            file = st.file_uploader("📸 上传菜单（文字）或菜品（实拍）", type=['jpg', 'jpeg', 'png'])
+            
+            result_area = st.empty()
+
+            if st.button("🚀 智能识别分析", use_container_width=True):
                 if file:
-                    with st.spinner("分析中..."):
-                        img_np = np.array(Image.open(file))
-                        ocr_text = " ".join(get_ocr_reader().readtext(img_np, detail=0))
-                        ph = st.empty(); full = ""
-                        # AI 提示词集成用户画像
-                        prompt = f"用户画像：{user_nickname}，长期忌口：{user_allergies}。当前特殊需求：{goal}。菜单：{ocr_text}。请分析。"
-                        response = client.chat.completions.create(model="deepseek-chat", messages=[{"role":"user","content":prompt}], stream=True)
-                        for chunk in response:
-                            if chunk.choices[0].delta.content:
-                                full += chunk.choices[0].delta.content
-                                ph.markdown(full)
-                        save_record("餐饮识别", full)
+                    with st.spinner("智生活正在感知图片内容..."):
+                        # --- 核心路由逻辑开始 ---
+                        # 1. 先运行 EasyOCR
+                        img_pil = Image.open(file)
+                        img_np = np.array(img_pil)
+                        ocr_result = get_ocr_reader().readtext(img_np, detail=0)
+                        
+                        # 2. 判断：如果识别到的文字数量 > 5，认为是菜单
+                        if len(ocr_result) >= 5:
+                            st.toast("检测到菜单文字，启动 DeepSeek 文本分析引擎", icon="📄")
+                            ocr_text = " ".join(ocr_result)
+                            prompt = f"用户画像：{user_nickname}，需求：{goal}。菜单文字：{ocr_text}。请进行过敏原筛查并推荐菜品及热量。"
+                            
+                            # 调用 DeepSeek (代码同之前，略)
+                            response = client.chat.completions.create(
+                                model="deepseek-chat",
+                                messages=[{"role": "user", "content": prompt}],
+                                stream=True
+                            )
+                            full = ""
+                            for chunk in response:
+                                if chunk.choices[0].delta.content:
+                                    full += chunk.choices[0].delta.content
+                                    result_area.markdown(full)
+
+                        # 3. 如果文字很少，认为是菜品实拍
+                        else:
+                            st.toast("检测到纯菜品图像，启动 Qwen-VL 视觉感知引擎", icon="👁️")
+                            # 调用 Qwen-VL
+                            vision_report = analyze_food_image_with_qwen(file, goal)
+                            result_area.markdown(vision_report)
+                        
+                        save_record("餐饮识别", "分析完成")
 
     # 场景：出行
     elif st.session_state.active_tab == "🚗 出行":
@@ -217,18 +267,19 @@ def main():
             
             c1, c2 = st.columns(2)
 
+            # 定义 AI 运行逻辑
             def run_travel_ai(is_new=True):
                 if not query:
                     st.warning("请输入目的地")
                     return
 
-                # 【关键逻辑 1】开启生成状态，暂时关闭底部的静态显示
+                # 【核心修改 1】开启生成状态，屏蔽底部静态区域显示
                 st.session_state.is_generating = True 
                 
                 with st.spinner("智生活正在校准并为您规划行程..."):
+                    # 地名纠偏逻辑
                     if is_new:
                         st.session_state.travel_messages = []
-                        # 地名纠偏
                         correct_res = client.chat.completions.create(
                             model="deepseek-chat",
                             messages=[{"role": "user", "content": f"请返回'{query}'对应的省份城市景区全称，仅返回地名。"}]
@@ -241,21 +292,20 @@ def main():
                     if info:
                         st.session_state.last_located_address = info['full_address']
                         
-                        # 构造系统提示词
                         sys_prompt = f"""
                         你是一位旅游管家。目的地：{info['full_address']}，天气：{info['weather']}。
                         要求：
-                        1. 严格按照用户要求的天数生成行程表。
+                        1. 严格按照用户要求的天数生成行程表（如4日游必须写满4天）。
                         2. 必须使用 Markdown 表格。
-                        3. **禁止**使用 <br>、<div> 等任何 HTML 标签，换行请直接使用空格或分号。
-                        4. 购票链接：[点击购票](https://m.ctrip.com/webapp/ticket/ticket?keyword={info['full_address']})。
+                        3. 禁止使用 <br>、<div> 等任何 HTML 标签，换行直接用分号。
+                        4. 购票链接格式：[点击购票](https://m.ctrip.com/webapp/ticket/ticket?keyword={info['full_address']})。
                         """
                         
                         st.session_state.travel_messages.append({"role": "user", "content": query})
                         
-                        # 【关键逻辑 2】使用唯一的显示占位符
-                        ph = st.empty() 
-                        full_content = ""
+                        # --- 流式显示逻辑开始 ---
+                        ph = st.empty() # 创建占位容器
+                        accumulated_text = "" 
                         
                         response = client.chat.completions.create(
                             model="deepseek-chat",
@@ -265,34 +315,44 @@ def main():
                         
                         for chunk in response:
                             if chunk.choices[0].delta.content:
-                                text_chunk = chunk.choices[0].delta.content
-                                # 【关键逻辑 3】实时清洗 <br> 标签
-                                text_chunk = text_chunk.replace("<br>", " ").replace("<br/>", " ")
-                                full_content += text_chunk
-                                ph.markdown(full_content)
+                                # 【核心修改 2】先累加原始文本
+                                accumulated_text += chunk.choices[0].delta.content
+                                
+                                # 【核心修改 3】对累计后的全量文本进行清洗，而不是只清洗碎片
+                                # 这样即便 <br> 被切断成了 "<b" 和 "r>"，拼接后也能被正确替换
+                                clean_display = accumulated_text.replace("<br>", " ").replace("<br/>", " ")
+                                
+                                # 实时在占位符中显示清洗后的文字
+                                ph.markdown(clean_display)
                         
-                        # 保存结果并重置生成状态
-                        st.session_state.current_plan = full_content
-                        st.session_state.travel_messages.append({"role": "assistant", "content": full_content})
-                        save_record("行程规划", full_content)
+                        # 生成彻底结束，保存最终清洗后的计划
+                        final_plan = accumulated_text.replace("<br>", " ").replace("<br/>", " ")
+                        st.session_state.current_plan = final_plan
+                        st.session_state.travel_messages.append({"role": "assistant", "content": final_plan})
+                        save_record("行程规划", final_plan)
+                        
+                        # 【核心修改 4】生成完毕，关闭生成状态
                         st.session_state.is_generating = False
                     else:
                         st.error("定位失败")
                         st.session_state.is_generating = False
 
+            # --- 按钮触发 ---
             if c1.button("🌟 生成全新行程", use_container_width=True, key="gen_final"):
                 run_travel_ai(is_new=True)
-                st.rerun() # 生成完强制刷新一次，清理掉占位符，交给底部的静态显示
+                st.rerun() # 必须 rerun：销毁按钮内的占位符，由底部的静态判断来接管显示
             
             if c2.button("🔄 修改/追加需求", use_container_width=True, key="upd_final"):
                 run_travel_ai(is_new=False)
                 st.rerun()
 
-        # --- 【关键逻辑 4】静态显示区 ---
-        # 只有在不处于生成状态时才显示，彻底解决显示 2 次的问题
+        # --- 5. 静态显示区（结果的归宿） ---
+        # 逻辑：只有在【不生成时】且【有计划内容时】才显示
         if st.session_state.current_plan and not st.session_state.is_generating:
             st.markdown("---")
             st.markdown(st.session_state.current_plan)
+            # 下载功能放在这里也很整洁
+            st.download_button("💾 下载离线行程单", st.session_state.current_plan, file_name="trip.md")
                 
 
     # 场景：历史
@@ -309,7 +369,7 @@ def main():
         with st.container(border=True):
             st.subheader("基本信息修改")
             new_nick = st.text_input("我的昵称", value=user_nickname)
-            new_allergies = st.text_area("我的过敏原/饮食忌口 (AI将自动记住)", value=user_allergies, help="例如：我不吃香菜，我对花生和虾过敏")
+            new_allergies = st.text_area("我的过敏原/饮食忌口 (之生活将自动记住)", value=user_allergies, help="例如：我不吃香菜，我对花生和虾过敏")
             if st.button("💾 保存画像信息", use_container_width=True, type="primary"):
                 save_user_profile(st.session_state.username, new_nick, new_allergies)
                 st.success("信息已同步！AI 现在更了解您了。")
