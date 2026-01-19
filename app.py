@@ -122,73 +122,106 @@ def get_amap_info(address):
 # --- 样式注入 ---
 st.markdown("""
 <style>
-    /* 1. 彻底隐藏底部页脚 (Built with Streamlit) */
-        footer {
-            display: none !important;
-            visibility: hidden !important;
-        }
-
-        /* 2. 彻底隐藏右下角的 Viewer Badge (包含 Fullscreen 和 Logo) */
-        /* 使用通配符选择器，精准打击所有以 viewerBadge 开头的类 */
-        div[class^="viewerBadge"], 
-        div[class*="viewerBadge"],
-        [data-testid="stStatusWidget"] {
-            display: none !important;
-            visibility: hidden !important;
-        }
-
-        /* 3. 隐藏顶部装饰条和头像菜单 */
-        header, [data-testid="stHeader"], #MainMenu {
-            display: none !important;
-            visibility: hidden !important;
-        }
-
-        /* 4. 强制主容器填满底部，消除底部留白 */
-        .main .block-container {
-            padding-bottom: 0px !important;
-        }
-        
-        /* 5. 针对移动端 WebView 优化，防止页面底部被遮挡或出现白边 */
-        .stApp {
-            bottom: 0 !important;
-            position: fixed !important;
-        }
-    /* 录音组件消除背景和边框，高度自适应 */
-    iframe[title="streamlit_mic_recorder.speech_to_text"] { 
-        width: 160px !important; 
-        height: 60px !important; 
-        border: none !important; 
-        background: transparent !important; 
+    /* 1. 彻底清除官方所有装饰（页头、页脚、部署按钮、右下角徽标） */
+    header, footer, .stDeployButton, [data-testid="stHeader"], [data-testid="stStatusWidget"] {
+        display: none !important;
+        visibility: hidden !important;
     }
 
-    /* 强制让录音插件所在的容器不带额外装饰 */
-    [data-testid="stVerticalBlock"] div:has(iframe) {
-        background-color: transparent !important;
+    /* 2. 移除右下角随键盘移动的白色提示 (Fullscreen/Viewer Badge) */
+    div[class^="viewerBadge"], div[class*="viewerBadge"] {
+        display: none !important;
+    }
+
+    /* 3. 全局页面背景与字体 */
+    .stApp {
+        background-color: #f8f9fb !important;
+    }
+
+    /* 4. 主内容区适配：顶部留出固定头的高度，底部留出导航栏高度 */
+    .main .block-container {
+        padding-top: 260px !important;  /* 根据标题大小微调 */
+        padding-bottom: 120px !important; 
+        max-width: 800px !important;
+        margin: auto;
+    }
+
+    /* 5. 顶部固定头部 (标题 + 导航标签) */
+    .fixed-header {
+        position: fixed !important;
+        top: 0px !important;
+        left: 0px !important;
+        width: 100% !important;
+        background-color: white !important;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.05) !important;
+        z-index: 999999 !important;
+        padding: 40px 0 30px 0 !important;
+        text-align: center;
+    }
+
+    /* 6. 导航按钮间距排列 */
+    .fixed-header [data-testid="stHorizontalBlock"] {
+        display: flex !important;
+        flex-direction: row !important;
+        justify-content: center !important;
+        gap: 15px !important;
+        max-width: 700px !important;
+        margin: 0 auto !important;
+    }
+
+    /* 7. 按钮样式：去红边、蓝色高亮、圆角 */
+    div.stButton > button {
+        border-radius: 14px !important;
+        height: 45px !important;
+        font-weight: 600 !important;
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+        transition: all 0.2s;
+    }
+    
+    /* 选中态：蓝色 */
+    div.stButton > button[kind="primary"] {
+        background-color: #1E5EFF !important;
+        color: white !important;
+    }
+    
+    /* 未选中态：浅灰 */
+    div.stButton > button[kind="secondary"] {
+        background-color: #fcfcfc !important;
+        color: #666 !important;
+        border: 1px solid #f0f2f6 !important;
+    }
+
+    /* 彻底消除点击时的红色/蓝色外边框 */
+    button:focus, button:active, button:focus-visible {
+        outline: none !important;
+        box-shadow: none !important;
         border: none !important;
     }
-    header, footer, .stDeployButton, [data-testid="stHeader"] { display: none !important; }
-    .stApp { background-color: #f8f9fb !important; }
-    .main .block-container { padding-top: 250px !important; padding-bottom: 120px !important; max-width: 800px !important; margin: auto; }
-    
-    .fixed-header {
-        position: fixed !important; top: 0px !important; left: 0px !important; width: 100% !important;
-        background-color: white !important; box-shadow: 0 4px 20px rgba(0,0,0,0.05) !important;
-        z-index: 999999 !important; padding: 30px 0 35px 0 !important; text-align: center;
-    }
-    .fixed-header [data-testid="stHorizontalBlock"] { display: flex !important; gap: 10px !important; max-width: 700px !important; margin: 0 auto !important; }
 
-    div.stButton > button {
-        border-radius: 14px !important; height: 45px !important; font-weight: 600 !important;
-        border: none !important; outline: none !important; box-shadow: none !important;
+    /* 8. 录音组件深度美化：消除白色长条与切边 */
+    [data-testid="stVerticalBlock"] div:has(iframe[title="streamlit_mic_recorder.speech_to_text"]) {
+        width: fit-content !important;
+        background-color: transparent !important;
     }
-    div.stButton > button[kind="primary"] { background-color: #1E5EFF !important; color: white !important; }
-    div.stButton > button[kind="secondary"] { background-color: #fcfcfc !important; color: #666 !important; border: 1px solid #f0f2f6 !important; }
-    
-    /* 底部导航栏 */
-    .nav-container {
-        position: fixed !important; bottom: 0 !important; left: 0 !important; width: 100% !important;
-        background-color: white !important; padding: 10px 0 25px 0 !important;
-        box-shadow: 0 -4px 15px rgba(0,0,0,0.08) !important; z-index: 999999 !important;
+
+    iframe[title="streamlit_mic_recorder.speech_to_text"] {
+        width: 160px !important;
+        height: 70px !important;
+        border: none !important;
+        background: transparent !important;
+    }
+
+    /* 9. 底部空白遮罩（防止漏光） */
+    .footer-mask {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        width: 100%;
+        height: 30px;
+        background-color: #f8f9fb;
+        z-index: 999997;
     }
 </style>
 """, unsafe_allow_html=True)
