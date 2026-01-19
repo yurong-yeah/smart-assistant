@@ -1,6 +1,5 @@
 streamlit
 openai
-easyocr
 Pillow
 numpy
-streamlit-mic-recorder
+requests
