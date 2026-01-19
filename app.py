@@ -5,7 +5,6 @@ import numpy as np
 import sqlite3
 from datetime import datetime
 import json
-from streamlit_mic_recorder import speech_to_text
 import requests
 import hashlib
 import base64
