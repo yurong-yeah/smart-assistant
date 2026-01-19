@@ -122,29 +122,37 @@ def get_amap_info(address):
 # --- 样式注入 ---
 st.markdown("""
 <style>
-    /* 1. 隐藏底部的 Built with Streamlit 文本和链接 */
-    footer {
-        visibility: hidden;
-        height: 0px !important;
-        display: none !important;
-    }
+    /* 1. 彻底隐藏底部页脚（Built with Streamlit） */
+        footer {
+            visibility: hidden !important;
+            height: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            display: none !important;
+        }
 
-    /* 2. 隐藏右下角的悬浮管理小工具（红三角） */
-    [data-testid="stStatusWidget"] {
-        visibility: hidden;
-        display: none !important;
-    }
+        /* 2. 隐藏右下角的 Streamlit 徽标和“Fullscreen”小按钮 */
+        [data-testid="stStatusWidget"], .viewerBadge_container__1QSob {
+            display: none !important;
+            visibility: hidden !important;
+        }
 
-    /* 3. 隐藏顶部的装饰横条 */
-    header {
-        visibility: hidden;
-        height: 0px !important;
-    }
-    
-    /* 4. 彻底消除底部可能留下的空白高度 */
-    .main .block-container {
-        padding-bottom: 0rem !important;
-    }
+        /* 3. 隐藏顶部可能出现的装饰条和菜单 */
+        header, [data-testid="stHeader"], #MainMenu {
+            display: none !important;
+            visibility: hidden !important;
+        }
+
+        /* 4. 强制主页面内容区填满到底部，不留任何白条空间 */
+        .main .block-container {
+            padding-bottom: 0px !important;
+            margin-bottom: -50px !important; /* 向上微调，吃掉底部的留白 */
+        }
+        
+        /* 5. 针对 WebIntoApp 的 Toolbar 进行清理（如果有的话） */
+        .stApp {
+            bottom: 0 !important;
+        }
     /* 录音组件消除背景和边框，高度自适应 */
     iframe[title="streamlit_mic_recorder.speech_to_text"] { 
         width: 160px !important; 
