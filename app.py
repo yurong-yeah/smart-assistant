@@ -122,36 +122,36 @@ def get_amap_info(address):
 # --- 样式注入 ---
 st.markdown("""
 <style>
-    /* 1. 彻底隐藏底部页脚（Built with Streamlit） */
+    /* 1. 彻底隐藏底部页脚 (Built with Streamlit) */
         footer {
-            visibility: hidden !important;
-            height: 0 !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            display: none !important;
-        }
-
-        /* 2. 隐藏右下角的 Streamlit 徽标和“Fullscreen”小按钮 */
-        [data-testid="stStatusWidget"], .viewerBadge_container__1QSob {
             display: none !important;
             visibility: hidden !important;
         }
 
-        /* 3. 隐藏顶部可能出现的装饰条和菜单 */
+        /* 2. 彻底隐藏右下角的 Viewer Badge (包含 Fullscreen 和 Logo) */
+        /* 使用通配符选择器，精准打击所有以 viewerBadge 开头的类 */
+        div[class^="viewerBadge"], 
+        div[class*="viewerBadge"],
+        [data-testid="stStatusWidget"] {
+            display: none !important;
+            visibility: hidden !important;
+        }
+
+        /* 3. 隐藏顶部装饰条和头像菜单 */
         header, [data-testid="stHeader"], #MainMenu {
             display: none !important;
             visibility: hidden !important;
         }
 
-        /* 4. 强制主页面内容区填满到底部，不留任何白条空间 */
+        /* 4. 强制主容器填满底部，消除底部留白 */
         .main .block-container {
             padding-bottom: 0px !important;
-            margin-bottom: -50px !important; /* 向上微调，吃掉底部的留白 */
         }
         
-        /* 5. 针对 WebIntoApp 的 Toolbar 进行清理（如果有的话） */
+        /* 5. 针对移动端 WebView 优化，防止页面底部被遮挡或出现白边 */
         .stApp {
             bottom: 0 !important;
+            position: fixed !important;
         }
     /* 录音组件消除背景和边框，高度自适应 */
     iframe[title="streamlit_mic_recorder.speech_to_text"] { 
@@ -418,6 +418,17 @@ def main():
         if st.button("🚪 退出登录", use_container_width=True):
             st.session_state.logged_in = False
             st.rerun()
+    st.markdown("""
+        <div style="
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 40px;
+            background-color: #f8f9fb;
+            z-index: 999997;
+        "></div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     import time
