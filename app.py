@@ -1,6 +1,5 @@
 import streamlit as st
 import openai
-import easyocr
 from PIL import Image
 import numpy as np
 import sqlite3
@@ -163,28 +162,26 @@ def main():
     if st.session_state.active_tab == "🥗 餐厅":
         st.markdown(f"#### 欢迎回来，{user_nickname}")
         with st.container(border=True):
-            mode = st.radio("识别模式", ["📄 菜单文字", "🖼️ 菜品实拍"], horizontal=True)
-            goal = st.text_input("健康需求", value=user_allergies)
-            file = st.file_uploader("上传照片")
-            res_area = st.empty()
-            if st.button("🚀 开始分析", use_container_width=True):
+            # 去掉模式选择，直接一个上传框
+            st.info("💡 提示：支持直接拍摄菜单或菜品，云端引擎将自动感知")
+            goal = st.text_input("📋 健康需求", value=user_allergies)
+            file = st.file_uploader("📸 上传图片", type=['jpg', 'jpeg', 'png'])
+            
+            result_area = st.empty()
+
+            if st.button("🚀 开始智能分析", use_container_width=True):
                 if file:
-                    gc.collect()
-                    if mode == "📄 菜单文字":
-                        with st.spinner("分析中..."):
-                            img_pil = Image.open(file); img_pil.thumbnail((700, 700))
-                            ocr_text = " ".join(get_ocr_reader().readtext(np.array(img_pil), detail=0))
-                            prompt = f"画像忌口：{user_allergies}。需求：{goal}。菜单：{ocr_text}。请检查并详细分析。"
-                            response = client.chat.completions.create(model="deepseek-chat", messages=[{"role":"user","content":prompt}], stream=True)
-                            full = ""
-                            for chunk in response:
-                                if chunk.choices[0].delta.content: full += chunk.choices[0].delta.content; res_area.markdown(full)
-                            save_record("餐饮", full)
-                    else:
-                        with st.spinner("千问感知中..."):
-                            full = analyze_food_image_with_qwen(file, goal)
-                            res_area.markdown(full); save_record("餐饮", full)
-                else: st.warning("请上传图片")
+                    with st.spinner("智生活云端引擎正在感知图片内容..."):
+                        # --- 核心修改：不再运行本地 EasyOCR，直接把图发给阿里云 ---
+                        try:
+                            # 无论菜单还是菜品，Qwen-VL 都能看懂
+                            vision_report = analyze_food_image_with_qwen(file, goal)
+                            result_area.markdown(vision_report)
+                            save_record("餐饮识别", vision_report)
+                        except Exception as e:
+                            st.error(f"分析失败，请检查 API Key 余额或网络: {e}")
+                else:
+                    st.warning("请先上传照片")
 
     # --- 场景：出行 ---
     elif st.session_state.active_tab == "🚗 出行":
