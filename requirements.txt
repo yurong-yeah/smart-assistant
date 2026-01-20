@@ -3,3 +3,5 @@ openai
 Pillow
 numpy
 requests
+folium
+streamlit-folium
