@@ -1,16 +1,22 @@
 import streamlit as st
 import openai
+import easyocr
 from PIL import Image
 import numpy as np
 import sqlite3
 from datetime import datetime
 import json
+from streamlit_mic_recorder import speech_to_text
 import requests
 import hashlib
 import base64
 from io import BytesIO
-import gc
-
+import plotly.express as px  # 新增：用于绘制柱状图
+import plotly.graph_objects as go # 新增：用于绘制雷达图
+import folium # 新增：用于地图
+from streamlit_folium import st_folium # 新增：用于网页显示地图
+import re
+import time
 # ==========================================
 # 1. 基础配置
 # ==========================================
@@ -20,7 +26,6 @@ client = openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.
 if 'active_tab' not in st.session_state: st.session_state.active_tab = "🥗 餐厅"
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'username' not in st.session_state: st.session_state.username = ""
-if 'travel_messages' not in st.session_state: st.session_state.travel_messages = []
 if 'current_plan' not in st.session_state: st.session_state.current_plan = ""
 
 st.set_page_config(page_title="智生活", page_icon="🌟", layout="wide", initial_sidebar_state="collapsed")
@@ -28,7 +33,7 @@ st.set_page_config(page_title="智生活", page_icon="🌟", layout="wide", init
 AMAP_KEY = "b609ca55fb8d7dc44546632460d0e93a"  
 
 # ==========================================
-# 2. 数据库逻辑 (保持不变)
+# 2. 数据库逻辑
 # ==========================================
 def init_db():
     with sqlite3.connect('history.db') as conn:
@@ -36,10 +41,9 @@ def init_db():
                      (username TEXT PRIMARY KEY, password TEXT, nickname TEXT, allergies TEXT)''')
         conn.execute('CREATE TABLE IF NOT EXISTS records (username TEXT, type TEXT, content TEXT, time TEXT)')
 
-def save_record(rtype, content):
+def save_user_profile(username, nickname, allergies):
     with sqlite3.connect('history.db') as conn:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute("INSERT INTO records VALUES (?, ?, ?, ?)", (st.session_state.username, rtype, content, now))
+        conn.execute("UPDATE users SET nickname=?, allergies=? WHERE username=?", (nickname, allergies, username))
 
 def get_user_data(username):
     with sqlite3.connect('history.db') as conn:
@@ -61,125 +65,210 @@ def create_user(username, password):
             return True
         except: return False
 
+def save_record(rtype, content):
+    with sqlite3.connect('history.db') as conn:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("INSERT INTO records VALUES (?, ?, ?, ?)", (st.session_state.username, rtype, str(content), now))
+
 # ==========================================
-# 3. 核心工具函数（POI 搜索强化版）
+# 3. 核心功能函数
 # ==========================================
 @st.cache_resource
 def get_ocr_reader(): return easyocr.Reader(['ch_sim', 'en'])
 
-def get_amap_info(address):
-    """三级渐进式 POI 搜索逻辑"""
-    search_list = [address, f"{address}景区", f"四川{address}"] # 尝试多种搜索词组合
-    
-    for kw in search_list:
-        try:
-            # 使用 place/text 接口，增加 types=风景名胜 权重
-            poi_url = f"https://restapi.amap.com/v3/place/text?keywords={kw}&key={AMAP_KEY}&types=风景名胜&offset=1&page=1"
-            res = requests.get(poi_url).json()
-            if res['status'] == '1' and res['pois']:
-                poi = res['pois'][0]
-                return {
-                    "full_address": f"{poi['pname']}{poi['cityname']}{poi['adname']}{poi['name']}",
-                    "adcode": poi['adcode'],
-                    "city": poi['cityname'],
-                    "location": poi['location']
-                }
-        except: continue
-    return None
-
-def get_real_weather(adcode):
-    """获取真实天气数据"""
-    try:
-        url = f"https://restapi.amap.com/v3/weather/weatherInfo?city={adcode}&key={AMAP_KEY}"
-        res = requests.get(url).json()
-        if res['status'] == '1' and res['lives']:
-            w = res['lives'][0]
-            return f"{w['weather']}，气温{w['temperature']}℃，风力{w['windpower']}级"
-    except: return "晴（实时天气同步失败，采用标准气候建议）"
-    return "未知"
-
 def analyze_food_image_with_qwen(image_file, user_goal):
     encoded_image = base64.b64encode(image_file.getvalue()).decode('utf-8')
     qwen_client = openai.OpenAI(api_key="sk-3277028448bf47fb84a4dd96a1cb9e4e", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    # 强制要求返回 JSON 格式以便可视化
+    prompt = f"""
+    你是AI营养师。过敏原：{user_goal}。请分析图片中的菜品。
+    要求：1.先给出文字分析建议。2.最后必须提供一个JSON格式的数据块，包含各菜品及其热量(kcal)，格式如下：
+    DATA_START
+    {{"items": ["菜名1", "菜名2"], "calories": [150, 300], "health_scores": [90, 60]}}
+    DATA_END
+    """
     response = qwen_client.chat.completions.create(
         model="qwen-vl-plus",
-        messages=[{"role": "user", "content": [{"type": "text", "text": f"你是AI营养师。过敏原：{user_goal}。请识图中食材，给建议和热量。"},
+        messages=[{"role": "user", "content": [{"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}}]}]
     )
     return response.choices[0].message.content
 
+def get_amap_info(address):
+    try:
+        geo_url = f"https://restapi.amap.com/v3/geocode/geo?address={address}&key={AMAP_KEY}"
+        res = requests.get(geo_url).json()
+        if res['status'] == '1' and res['geocodes']:
+            loc = res['geocodes'][0]
+            w_url = f"https://restapi.amap.com/v3/weather/weatherInfo?city={loc['adcode']}&key={AMAP_KEY}"
+            w_data = requests.get(w_url).json()
+            weather = w_data['lives'][0] if w_data['status']=='1' else None
+            return {"address": loc['formatted_address'], "weather": weather, "location": loc['location']}
+    except: return None
+
 # ==========================================
-# 4. 样式与布局
+# 4. 可视化组件
+# ==========================================
+def show_meal_visuals(json_str):
+    """将从文本中提取的JSON字符串转换为动态图表"""
+    try:
+        data = json.loads(json_str)
+        st.markdown("### 📊 营养成分动态监测")
+        v_col1, v_col2 = st.columns(2)
+        
+        with v_col1:
+            # 动态柱状图：展示 AI 提取出的真实菜名和热量
+            fig_bar = px.bar(
+                x=data['items'], 
+                y=data['calories'],
+                labels={'x':'菜品', 'y':'热量 (kcal)'},
+                title="实时热量对比",
+                color=data['calories'],
+                color_continuous_scale='Blues'
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+            
+        with v_col2:
+            # 动态雷达图：展示 AI 给出的真实评分
+            fig_radar = go.Figure(data=go.Scatterpolar(
+                r=data['health_scores'],
+                theta=['健康度','油脂控制','控糖度','饱腹感','安全性'],
+                fill='toself',
+                line_color='#1E5EFF'
+            ))
+            fig_radar.update_layout(
+                polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                showlegend=False, 
+                title="综合营养画像"
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
+        return True
+    except Exception as e:
+        print(f"数据解析失败: {e}")
+        return False
+
+def show_travel_visuals(info):
+    """绘制地图和实时指标"""
+    if info:
+        st.markdown("### 🛰️ 目的地实时运行看板")
+        m_col1, m_col2, m_col3 = st.columns(3)
+        w = info['weather']
+        m_col1.metric("当前天气", w['weather'] if w else "未知")
+        m_col2.metric("实时气温", f"{w['temperature']}℃" if w else "未知")
+        m_col3.metric("建议指数", "🌟 极佳" if "晴" in str(w) else "⚠️ 注意")
+
+        # 渲染 Folium 地图
+        lon, lat = map(float, info['location'].split(','))
+        m = folium.Map(location=[lat, lon], zoom_start=13, tiles='OpenStreetMap')
+        folium.Marker([lat, lon], popup=info['address'], icon=folium.Icon(color='blue', icon='info-sign')).add_to(m)
+        st_folium(m, width=700, height=300)
+
+# ==========================================
+# 5. 样式与主逻辑
 # ==========================================
 st.markdown("""
 <style>
-    header, footer, .stDeployButton, [data-testid="stHeader"], [data-testid="stStatusWidget"] { display: none !important; }
+    header, footer, [data-testid="stHeader"] { display: none !important; }
     .stApp { background-color: #f8f9fb !important; }
-    .main .block-container { padding-top: 260px !important; padding-bottom: 120px !important; max-width: 800px !important; margin: auto; }
-    .fixed-header { position: fixed !important; top: 0px !important; left: 0px !important; width: 100% !important; background-color: white !important; box-shadow: 0 4px 20px rgba(0,0,0,0.05) !important; z-index: 999999 !important; padding: 40px 0 30px 0 !important; text-align: center; }
-    .fixed-header [data-testid="stHorizontalBlock"] { display: flex !important; gap: 10px !important; max-width: 700px !important; margin: 0 auto !important; }
-    div.stButton > button { border-radius: 14px !important; height: 45px !important; font-weight: 600 !important; border: none !important; outline: none !important; box-shadow: none !important; }
-    div.stButton > button[kind="primary"] { background-color: #1E5EFF !important; color: white !important; }
-    div.stButton > button[kind="secondary"] { background-color: #fcfcfc !important; color: #666 !important; border: 1px solid #f0f2f6 !important; }
-    iframe[title="streamlit_mic_recorder.speech_to_text"] { width: 160px !important; height: 60px !important; border: none !important; background: transparent !important; }
+    .main .block-container { padding-top: 250px !important; padding-bottom: 120px !important; max-width: 900px !important; margin: auto; }
+    .fixed-header { position: fixed !important; top: 0px !important; left: 0px !important; width: 100% !important; background-color: white !important; box-shadow: 0 4px 20px rgba(0,0,0,0.05) !important; z-index: 999999 !important; padding: 30px 0 35px 0 !important; text-align: center; }
+    div.stButton > button { border-radius: 14px !important; height: 45px !important; font-weight: 600 !important; }
+    .nav-container { position: fixed !important; bottom: 0 !important; left: 0 !important; width: 100% !important; background-color: white !important; padding: 10px 0 25px 0 !important; box-shadow: 0 -4px 15px rgba(0,0,0,0.08) !important; z-index: 999999 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 5. 主逻辑渲染
-# ==========================================
 def main():
     init_db()
-
     if not st.session_state.logged_in:
         st.markdown("<br><br><br><h1 style='text-align: center; color: #1E5EFF;'>智生活助手</h1>", unsafe_allow_html=True)
         with st.container(border=True):
             choice = st.radio("请选择", ["登录", "注册"], horizontal=True)
             u = st.text_input("账号"); p = st.text_input("密码", type='password')
-            if choice == "登录" and st.button("立即登录", use_container_width=True, type="primary"):
+            if choice == "登录" and st.button("进入系统", use_container_width=True, type="primary"):
                 if login_user(u, p): st.session_state.logged_in, st.session_state.username = True, u; st.rerun()
-                else: st.error("账号或密码错误")
-            elif choice == "注册" and st.button("点击注册", use_container_width=True, type="primary"):
+                else: st.error("密码错误")
+            elif choice == "注册" and st.button("注册", use_container_width=True, type="primary"):
                 if create_user(u, p): st.success("成功！请登录")
-                else: st.error("账号已存在")
         return
 
     user_nickname, user_allergies = get_user_data(st.session_state.username)
 
     # 固定头部
     st.markdown('<div class="fixed-header">', unsafe_allow_html=True)
-    st.markdown(f'<h1 style="margin:0; padding-bottom: 25px; color:#333; font-size: 38px; font-weight: 800;">🤖 智生活助手</h1>', unsafe_allow_html=True)
+    st.markdown(f'<h1 style="margin:0; padding-bottom: 25px; color:#333; font-size: 32px; font-weight: 800;">🤖 智生活助手</h1>', unsafe_allow_html=True)
     nav_cols = st.columns(4)
     tabs = ["🥗 餐厅", "🚗 出行", "📂 历史", "👤 我的"]
     for i, tab in enumerate(tabs):
         with nav_cols[i]:
-            if st.button(tab, key=f"nav_{i}", use_container_width=True, type="primary" if st.session_state.active_tab == tab else "secondary"):
+            if st.button(tab, key=f"n_{i}", use_container_width=True, type="primary" if st.session_state.active_tab == tab else "secondary"):
                 st.session_state.active_tab = tab; st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
     # --- 场景：餐厅 ---
     if st.session_state.active_tab == "🥗 餐厅":
-        st.markdown(f"#### 欢迎回来，{user_nickname}")
+        st.markdown(f"#### 欢迎，{user_nickname}")
         with st.container(border=True):
-            # 去掉模式选择，直接一个上传框
-            st.info("💡 提示：支持直接拍摄菜单或菜品，云端引擎将自动感知")
-            goal = st.text_input("📋 健康需求", value=user_allergies)
-            file = st.file_uploader("📸 上传图片", type=['jpg', 'jpeg', 'png'])
-            
-            result_area = st.empty()
-
-            if st.button("🚀 开始智能分析", use_container_width=True):
+            mode = st.radio("模式", ["📄 菜单文字", "🖼️ 菜品实拍"], horizontal=True)
+            goal = st.text_input("健康需求", value=user_allergies)
+            file = st.file_uploader("上传照片")
+            if st.button("🚀 智能分析", use_container_width=True):
                 if file:
-                    with st.spinner("智生活云端引擎正在感知图片内容..."):
-                        # --- 核心修改：不再运行本地 EasyOCR，直接把图发给阿里云 ---
-                        try:
-                            # 无论菜单还是菜品，Qwen-VL 都能看懂
-                            vision_report = analyze_food_image_with_qwen(file, goal)
-                            result_area.markdown(vision_report)
-                            save_record("餐饮识别", vision_report)
-                        except Exception as e:
-                            st.error(f"分析失败，请检查 API Key 余额或网络: {e}")
-                else:
+                    import re  # 必须导入正则模块
+                    with st.spinner("智生活正在深度感知并生成可视化画像..."):
+                        if mode == "📄 菜单文字":
+                            # 1. OCR 识字
+                            img_pil = Image.open(file); img_pil.thumbnail((700, 700))
+                            ocr_text = " ".join(get_ocr_reader().readtext(np.array(img_pil), detail=0))
+                            
+                            # 2. 增强 Prompt，强制 AI 输出数据块
+                            prompt = f"""
+                            你是一位AI营养师。忌口：{user_allergies}。需求：{goal}。
+                            菜单文本：{ocr_text}。
+                            请进行详细分析并给出建议。
+                            
+                            【重要：最后必须严格按以下格式提供可视化数据】
+                            DATA_START
+                            {{
+                                "items": ["菜名1", "菜名2", "菜名3"],
+                                "calories": [热量1, 热量2, 热量3],
+                                "health_scores": [评分1, 评分2, 评分3, 评分4, 评分5]
+                            }}
+                            DATA_END
+                            (注意：health_scores固定5个值，分别对应：健康度, 油脂控制, 控糖度, 饱腹感, 安全性，范围0-100)
+                            """
+                            res = client.chat.completions.create(
+                                model="deepseek-chat", 
+                                messages=[{"role":"user","content":prompt}]
+                            ).choices[0].message.content
+                        else:
+                            # Qwen-VL 逻辑（确保函数内部也要求了 DATA_START 格式）
+                            res = analyze_food_image_with_qwen(file, goal)
+
+                        # --- 核心修复逻辑：提取数据并清洗文字 ---
+                        
+                        # A. 尝试提取 JSON 并绘图
+                        chart_success = False
+                        data_match = re.search(r"DATA_START(.*?)DATA_END", res, re.DOTALL)
+                        if data_match:
+                            data_str = data_match.group(1).strip()
+                            # 调用你修改后的动态绘图函数（见下方补充）
+                            chart_success = show_meal_visuals(data_str) 
+                        
+                        # B. 清洗文字：把那些 DATA_START 之类的代码块删掉，不给用户看
+                        clean_report = re.sub(r"DATA_START.*?DATA_END", "", res, flags=re.DOTALL).strip()
+                        
+                        # C. 先显示图表（如果成功），再显示报告
+                        if chart_success:
+                            st.markdown("---")
+                            st.markdown("### 📋 智能诊断报告")
+                            st.write(clean_report)
+                        else:
+                            # 如果 AI 没按格式返回数据，至少把原始文字显出来
+                            st.warning("⚠️ 实时数据抓取较弱，仅显示文字报告")
+                            st.write(res)
+                            
+                        save_record("餐饮", clean_report)
+                else: 
                     st.warning("请先上传照片")
 
     # --- 场景：出行 ---
@@ -305,7 +394,7 @@ def main():
         with st.container(border=True):
             st.subheader("基本信息修改")
             new_nick = st.text_input("我的昵称", value=user_nickname)
-            new_allergies = st.text_area("我的过敏原/饮食忌口 (之生活将自动记住)", value=user_allergies, help="例如：我不吃香菜，我对花生和虾过敏")
+            new_allergies = st.text_area("我的过敏原/饮食忌口 (智生活将自动记住)", value=user_allergies, help="例如：我不吃香菜，我对花生和虾过敏")
             if st.button("💾 保存画像信息", use_container_width=True, type="primary"):
                 save_user_profile(st.session_state.username, new_nick, new_allergies)
                 st.success("信息已同步！AI 现在更了解您了。")
@@ -323,6 +412,5 @@ def main():
         if st.button("🚪 退出登录", use_container_width=True):
             st.session_state.logged_in = False
             st.rerun()
-            
 if __name__ == "__main__":
     main()
