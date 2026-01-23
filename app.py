@@ -39,13 +39,27 @@ AMAP_KEY = "b609ca55fb8d7dc44546632460d0e93a"
 # 修改 init_db 函数，增加 reminders 表
 def init_db():
     with sqlite3.connect('history.db') as conn:
+        # 增加 gender, age, health_goals 字段
         conn.execute('''CREATE TABLE IF NOT EXISTS users 
-                     (username TEXT PRIMARY KEY, password TEXT, nickname TEXT, allergies TEXT)''')
+                     (username TEXT PRIMARY KEY, password TEXT, nickname TEXT, 
+                      allergies TEXT, gender TEXT, age INTEGER, health_goals TEXT)''')
         conn.execute('CREATE TABLE IF NOT EXISTS records (username TEXT, type TEXT, content TEXT, time TEXT)')
-        # 新增：提醒/备忘录表 (status: 0-进行中, 1-已完成)
         conn.execute('''CREATE TABLE IF NOT EXISTS reminders 
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, type TEXT, content TEXT, trigger_time TEXT, status INTEGER)''')
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, type TEXT, 
+                      content TEXT, trigger_time TEXT, status INTEGER)''')
 
+# 更新保存画像的函数
+def save_full_profile(username, nickname, allergies, gender, age, health_goals):
+    with sqlite3.connect('history.db') as conn:
+        conn.execute("""UPDATE users SET nickname=?, allergies=?, gender=?, age=?, health_goals=? 
+                     WHERE username=?""", (nickname, allergies, gender, age, health_goals, username))
+
+# 更新获取数据的函数
+def get_user_data(username):
+    with sqlite3.connect('history.db') as conn:
+        c = conn.cursor()
+        c.execute("SELECT nickname, allergies, gender, age, health_goals FROM users WHERE username=?", (username,))
+        return c.fetchone()
 
 # 1. 添加提醒/备忘到数据库
 def add_reminder(username, r_type, content, t_time):
@@ -74,11 +88,6 @@ def save_user_profile(username, nickname, allergies):
     with sqlite3.connect('history.db') as conn:
         conn.execute("UPDATE users SET nickname=?, allergies=? WHERE username=?", (nickname, allergies, username))
 
-def get_user_data(username):
-    with sqlite3.connect('history.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT nickname, allergies FROM users WHERE username=?", (username,))
-        return c.fetchone()
 def update_password(username, new_password):
     with sqlite3.connect('history.db') as conn:
         hashed_pw = hashlib.sha256(str.encode(new_password)).hexdigest()
@@ -194,7 +203,31 @@ def show_travel_visuals(info):
         m = folium.Map(location=[lat, lon], zoom_start=13, tiles='OpenStreetMap')
         folium.Marker([lat, lon], popup=info['address'], icon=folium.Icon(color='blue', icon='info-sign')).add_to(m)
         st_folium(m, width=700, height=300)
-
+def generate_daily_recipe(nickname, gender, age, goals, allergies):
+    """根据画像生成每日三餐建议"""
+    # 构造画像背景
+    profile_desc = f"{gender}, {age}岁, 关注：{goals}。忌口：{allergies}。"
+    
+    prompt = f"""
+    你是一位资深营养管家。请为用户【{nickname}】定制今日的一日三餐。
+    用户画像：{profile_desc}
+    
+    要求：
+    1. 提供 早餐、午餐、晚餐 建议。
+    2. 每餐包含：菜名、主要营养价值、以及为什么适合该用户（结合健康目标）。
+    3. 风格温馨、专业。
+    4. 严禁使用 HTML 标签，使用 Markdown 格式。
+    5. 每次推荐要具有随机性和多样性。
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"菜谱生成失败，请检查网络：{e}"
 # ==========================================
 # 5. 样式与主逻辑
 # ==========================================
@@ -275,7 +308,48 @@ def main():
                 if create_user(u, p): st.success("成功！请登录")
         return
 
-    user_nickname, user_allergies = get_user_data(st.session_state.username)
+    # 1. 获取完整的用户画像数据
+    raw_data = get_user_data(st.session_state.username)
+    user_nickname, user_allergies, user_gender, user_age, user_goals = raw_data
+
+    # 2. 初始化画像调查状态
+    if 'survey_completed' not in st.session_state:
+        # 如果数据库里 health_goals 是空的，说明是新用户，需要弹窗
+        st.session_state.survey_completed = True if user_goals else False
+
+    # 3. 显示画像调查（如果未完成且未跳过）
+    if not st.session_state.survey_completed:
+        st.markdown("<br><br><br>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown("### 📝 开启您的智生活画像")
+            st.caption("为了提供更精准的饮食与出行建议，请完善您的基本信息（可跳过）")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                new_gender = st.radio("您的性别", ["男", "女", "保密"], horizontal=True)
+                new_age = st.number_input("您的年龄", min_value=1, max_value=120, value=25)
+            with col2:
+                new_nick = st.text_input("如何称呼您？", value=user_nickname)
+                # 预设的热门健康关注点
+                health_tags = st.multiselect(
+                    "健康关注点 (多选)",
+                    ["减脂瘦身", "增肌塑形", "糖尿病饮食", "高血压控盐", "高尿酸避坑", "备孕/孕期", "过敏体质"]
+                )
+            
+            new_aller = st.text_area("其他禁忌或注意事项", placeholder="例如：不吃香菜，花生过敏...")
+
+            btn_col1, btn_col2 = st.columns(2)
+            if btn_col1.button("💾 保存并开启", use_container_width=True, type="primary"):
+                goals_str = ",".join(health_tags)
+                save_full_profile(st.session_state.username, new_nick, new_aller, new_gender, new_age, goals_str)
+                st.session_state.survey_completed = True
+                st.success("画像已同步！正在进入系统...")
+                time.sleep(1); st.rerun()
+                
+            if btn_col2.button("⏩ 直接跳过", use_container_width=True):
+                st.session_state.survey_completed = True
+                st.rerun()
+        return # 阻止下方主页面显示，直到调查完成或跳过
 
     # 固定头部
     st.markdown('<div class="fixed-header">', unsafe_allow_html=True)
@@ -290,6 +364,32 @@ def main():
 
     # --- 场景：餐厅 ---
     if st.session_state.active_tab == "🥗 餐厅":
+        # 重新获取最新的画像数据
+        raw_data = get_user_data(st.session_state.username)
+        user_nickname, user_allergies, user_gender, user_age, user_goals = raw_data
+
+        st.markdown(f"#### 欢迎回来，{user_nickname}")
+        
+        # --- 新增：每日菜谱推荐区 ---
+        if 'daily_recipe' not in st.session_state:
+            st.session_state.daily_recipe = None
+
+        with st.expander("🍽️ 查看今日画像定制菜谱", expanded=True):
+            # 如果缓存中没菜谱，或者点击了刷新
+            if st.session_state.daily_recipe is None:
+                with st.spinner("正在根据您的画像精选今日食材..."):
+                    st.session_state.daily_recipe = generate_daily_recipe(
+                        user_nickname, user_gender, user_age, user_goals, user_allergies
+                    )
+            
+            # 显示菜谱内容
+            st.markdown(st.session_state.daily_recipe)
+            
+            # 刷新按钮
+            if st.button("🔄 换一换菜谱", use_container_width=True):
+                st.session_state.daily_recipe = None # 清空缓存
+                st.rerun() # 触发重绘，进入上面的生成逻辑
+    
         st.markdown(f"#### 欢迎，{user_nickname}")
         with st.container(border=True):
             mode = st.radio("模式", ["📄 菜单文字", "🖼️ 菜品实拍"], horizontal=True)
@@ -305,8 +405,9 @@ def main():
                             ocr_text = " ".join(get_ocr_reader().readtext(np.array(img_pil), detail=0))
                             
                             # 2. 增强 Prompt，强制 AI 输出数据块
+                            user_context = f"用户画像：{user_gender}, {user_age}岁, 健康目标：{user_goals}。过敏原/忌口：{user_allergies}。"
                             prompt = f"""
-                            你是一位AI营养师。忌口：{user_allergies}。需求：{goal}。
+                            你是一位AI营养师。{user_context} 忌口：{user_allergies}。需求：{goal}。
                             菜单文本：{ocr_text}。
                             请进行详细分析并给出建议。
                             
